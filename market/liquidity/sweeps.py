@@ -17,6 +17,10 @@ class LiquiditySweep:
 
     reason: str
 
+    @property
+    def confirmed(self) -> bool:
+        return self.reclaim
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "detected": self.detected,
@@ -27,6 +31,7 @@ class LiquiditySweep:
             "rejection": self.rejection,
             "strength": self.strength,
             "reason": self.reason,
+            "confirmed": self.confirmed,
         }
 
 
@@ -45,6 +50,7 @@ class LiquiditySweepDetector:
         previous_high: float | None = None,
         delta: float = 0.0,
         tolerance_pct: float = 0.0005,
+        close: float | None = None,
     ) -> LiquiditySweep:
 
         if price <= 0:
@@ -78,12 +84,12 @@ class LiquiditySweepDetector:
                     direction="sell_side",
                     level=low,
                     sweep_price=price,
-                    reclaim=False,
-                    rejection=True,
+                    reclaim=close is not None and close > low,
+                    rejection=close is None or close <= low,
                     strength=strength,
                     reason=(
                         "Price traded below "
-                        "previous swing low"
+                        "previous swing low; reclaim confirmation required"
                     ),
                 )
 
@@ -112,12 +118,12 @@ class LiquiditySweepDetector:
                     direction="buy_side",
                     level=high,
                     sweep_price=price,
-                    reclaim=False,
-                    rejection=True,
+                    reclaim=close is not None and close < high,
+                    rejection=close is None or close >= high,
                     strength=strength,
                     reason=(
                         "Price traded above "
-                        "previous swing high"
+                        "previous swing high; reclaim confirmation required"
                     ),
                 )
 

@@ -2,9 +2,13 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
-import websockets
+try:
+    import websockets
+except ImportError:  # pragma: no cover - exercised in dependency-free installs
+    websockets = None
 
 
 BYBIT_PUBLIC_WS = "wss://stream.bybit.com/v5/public/linear"
@@ -27,6 +31,10 @@ class BybitMarketData:
 
     last_trade_id: str | None = None
     last_update: float = 0.0
+    last_event_time: float | None = None
+    last_sequence: int | None = None
+    data_quality: str = "DATA_INCOMPLETE"
+    quality_reason: str = "Waiting for a valid order-book snapshot"
 
     def _clean_book(self) -> None:
 
@@ -41,6 +49,13 @@ class BybitMarketData:
             for price, qty in self.asks.items()
             if qty > 0
         }
+
+    def quality(self, max_age: float = 10.0) -> tuple[str, str]:
+        if self.data_quality != "OK":
+            return self.data_quality, self.quality_reason
+        if self.last_update <= 0 or time.time() - self.last_update > max_age:
+            return "DATA_STALE", "Market data is older than the allowed age"
+        return "OK", ""
 
     def sorted_bids(self, depth: int = 50):
         return sorted(
@@ -123,6 +138,22 @@ class BybitPublicFeed:
 
         self._trade_sequence = 0
 
+    def _reset_state(self) -> None:
+        self.data.bids.clear()
+        self.data.asks.clear()
+        self.data.trades.clear()
+        self.data.price = None
+        self.data.last_trade_id = None
+        self.data.last_update = 0.0
+        self.data.last_event_time = None
+        self.data.last_sequence = None
+        self.data.data_quality = "DATA_INCOMPLETE"
+        self.data.quality_reason = "Waiting for a valid order-book snapshot"
+
+    def _invalid(self, reason: str) -> None:
+        self.data.data_quality = "DATA_INVALID"
+        self.data.quality_reason = reason
+
     def _subscription_message(self):
 
         return {
@@ -141,6 +172,36 @@ class BybitPublicFeed:
         data = message.get("data")
 
         if not data:
+            self._invalid("Missing WebSocket data payload")
+            return
+
+        sequence = data.get("u")
+        if sequence is not None:
+            try:
+                sequence = int(sequence)
+            except (TypeError, ValueError):
+                self._invalid("Invalid order-book sequence")
+                return
+            if self.data.last_sequence is not None and sequence <= self.data.last_sequence:
+                self._invalid("Out-of-order order-book update")
+                return
+
+        def levels(key: str) -> list[tuple[float, float]] | None:
+            result = []
+            for level in data.get(key, []):
+                if not isinstance(level, (list, tuple)) or len(level) != 2:
+                    return None
+                price = float(level[0])
+                quantity = float(level[1])
+                if not isfinite(price) or not isfinite(quantity) or price <= 0 or quantity < 0:
+                    return None
+                result.append((price, quantity))
+            return result
+
+        bids = levels("b")
+        asks = levels("a")
+        if bids is None or asks is None:
+            self._invalid("Malformed or invalid order-book level")
             return
 
         # -----------------------------------------
@@ -152,26 +213,14 @@ class BybitPublicFeed:
             self.data.bids.clear()
             self.data.asks.clear()
 
-            for price, quantity in data.get(
-                "b",
-                [],
-            ):
-
-                price = float(price)
-                quantity = float(quantity)
+            for price, quantity in bids:
 
                 if quantity > 0:
                     self.data.bids[
                         price
                     ] = quantity
 
-            for price, quantity in data.get(
-                "a",
-                [],
-            ):
-
-                price = float(price)
-                quantity = float(quantity)
+            for price, quantity in asks:
 
                 if quantity > 0:
                     self.data.asks[
@@ -184,13 +233,7 @@ class BybitPublicFeed:
 
         else:
 
-            for price, quantity in data.get(
-                "b",
-                [],
-            ):
-
-                price = float(price)
-                quantity = float(quantity)
+            for price, quantity in bids:
 
                 if quantity == 0:
                     self.data.bids.pop(
@@ -202,13 +245,7 @@ class BybitPublicFeed:
                         price
                     ] = quantity
 
-            for price, quantity in data.get(
-                "a",
-                [],
-            ):
-
-                price = float(price)
-                quantity = float(quantity)
+            for price, quantity in asks:
 
                 if quantity == 0:
                     self.data.asks.pop(
@@ -222,12 +259,23 @@ class BybitPublicFeed:
 
         self.data._clean_book()
 
+        if self.data.bids and self.data.asks:
+            if max(self.data.bids) >= min(self.data.asks):
+                self._invalid("Order book is crossed")
+                return
+
+        if sequence is not None:
+            self.data.last_sequence = sequence
+
         best_bid = self.data.sorted_bids(1)
 
         if best_bid:
             self.data.price = best_bid[0][0]
 
         self.data.last_update = time.time()
+        self.data.last_event_time = float(message.get("ts", self.data.last_update * 1000)) / 1000
+        self.data.data_quality = "OK"
+        self.data.quality_reason = ""
 
     def _process_trade(
         self,
@@ -266,6 +314,10 @@ class BybitPublicFeed:
             ).upper(),
         }
 
+        if record["price"] <= 0 or record["quantity"] <= 0:
+            self._invalid("Invalid trade price or quantity")
+            return
+
         self.data.price = record["price"]
 
         self.data.trades.append(record)
@@ -274,6 +326,7 @@ class BybitPublicFeed:
         self.data.trades = self.data.trades[-5000:]
 
         self.data.last_update = time.time()
+        self.data.last_event_time = timestamp_ms / 1000
 
     def _process_message(
         self,
@@ -288,6 +341,7 @@ class BybitPublicFeed:
         data = message.get("data")
 
         if not data:
+            self._invalid("Missing WebSocket data payload")
             return
 
         if topic.startswith(
@@ -305,11 +359,17 @@ class BybitPublicFeed:
             if isinstance(data, list):
 
                 for trade in data:
-                    self._process_trade(
-                        trade
-                    )
+                    try:
+                        self._process_trade(trade)
+                    except (KeyError, TypeError, ValueError):
+                        self._invalid("Malformed trade payload")
 
     async def run(self) -> None:
+
+        if websockets is None:
+            raise RuntimeError(
+                "The optional 'websockets' dependency is required for live feeds"
+            )
 
         self.running = True
 
@@ -330,6 +390,8 @@ class BybitPublicFeed:
                     ping_interval=20,
                     ping_timeout=20,
                 ) as websocket:
+
+                    self._reset_state()
 
                     await websocket.send(
                         json.dumps(

@@ -88,6 +88,7 @@ class LiveMarketSnapshot:
         )
 
         rolling = self.rolling.snapshot()
+        quality, quality_reason = data.quality()
 
         return MarketState(
 
@@ -155,6 +156,13 @@ class LiveMarketSnapshot:
 
                 "top_asks":
                     data.snapshot_asks(20),
+            },
+
+            metadata={
+                "data_quality": quality,
+                "data_quality_reason": quality_reason,
+                "event_time": data.last_event_time,
+                "received_time": data.last_update,
             },
         )
 

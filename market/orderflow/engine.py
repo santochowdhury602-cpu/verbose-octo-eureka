@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 
@@ -18,7 +19,29 @@ class OrderFlowSnapshot:
 class OrderFlowEngine:
 
     def __init__(self):
-        self.cumulative_delta = 0.0
+        self._trades: dict[str, tuple[float, str, float]] = {}
+
+    @staticmethod
+    def _trade_id(trade: dict[str, Any]) -> str:
+        value = trade.get("id")
+        if value is not None and str(value):
+            return str(value)
+        return "|".join(
+            str(trade.get(key, ""))
+            for key in ("timestamp", "price", "quantity", "side")
+        )
+
+    def _remember(self, trade: dict[str, Any]) -> str | None:
+        trade_id = self._trade_id(trade)
+        timestamp = float(trade.get("timestamp", 0.0))
+        quantity = float(trade.get("quantity", 0.0))
+        side = str(trade.get("side", "")).upper()
+        if side not in {"BUY", "SELL"}:
+            return None
+        if not isfinite(timestamp) or not isfinite(quantity) or quantity < 0:
+            return None
+        self._trades.setdefault(trade_id, (timestamp, side, quantity))
+        return trade_id
 
     def analyze(
         self,
@@ -26,18 +49,18 @@ class OrderFlowEngine:
         orderbook_imbalance: float = 0.0,
     ) -> OrderFlowSnapshot:
 
+        current_ids = {
+            trade_id
+            for trade in trades
+            for trade_id in [self._remember(trade)]
+            if trade_id is not None
+        }
+
         buy_volume = 0.0
         sell_volume = 0.0
 
-        for trade in trades:
-
-            quantity = float(
-                trade.get("quantity", 0.0)
-            )
-
-            side = str(
-                trade.get("side", "")
-            ).upper()
+        for trade_id in sorted(current_ids):
+            _, side, quantity = self._trades[trade_id]
 
             if side == "BUY":
                 buy_volume += quantity
@@ -47,7 +70,13 @@ class OrderFlowEngine:
 
         delta = buy_volume - sell_volume
 
-        self.cumulative_delta += delta
+        cumulative_delta = sum(
+            quantity if side == "BUY" else -quantity
+            for _, side, quantity in sorted(
+                self._trades.values(),
+                key=lambda item: (item[0], item[1], item[2]),
+            )
+        )
 
         if sell_volume > 0:
             ratio = buy_volume / sell_volume
@@ -85,7 +114,7 @@ class OrderFlowEngine:
             buy_volume=buy_volume,
             sell_volume=sell_volume,
             delta=delta,
-            cumulative_delta=self.cumulative_delta,
+            cumulative_delta=cumulative_delta,
             buy_sell_ratio=ratio,
             orderbook_imbalance=orderbook_imbalance,
             bias=bias,

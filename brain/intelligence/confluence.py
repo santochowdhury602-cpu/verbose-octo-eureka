@@ -1,3 +1,57 @@
+from typing import Any
+
+from brain.confluence import ConfluenceEngine as CanonicalConfluenceEngine
+from brain.confluence import ConfluenceResult, Signal
+
+
+class ConfluenceEngine:
+    """Compatibility adapter backed by the canonical confluence engine."""
+
+    def __init__(self) -> None:
+        self._engine = CanonicalConfluenceEngine(
+            minimum_score=75.0,
+            strong_score=80.0,
+        )
+
+    def evaluate(
+        self,
+        market: dict[str, Any],
+        microstructure: dict[str, Any],
+    ) -> ConfluenceResult:
+        micro_bias = str(microstructure.get("bias", "WAIT")).upper()
+        micro_score = min(
+            60.0,
+            float(microstructure.get("score", 0.0) or 0.0) * 0.60,
+        )
+        direction = {
+            "LONG": "BULLISH",
+            "SHORT": "BEARISH",
+        }.get(micro_bias, "NEUTRAL")
+        signals = [Signal("Microstructure", direction, micro_score)]
+
+        structure_bias = str(
+            (market.get("structure") or {}).get("bias", "")
+        ).upper()
+        if structure_bias in {"BULLISH", "BEARISH"}:
+            signals.append(Signal("Market Structure", structure_bias, 20.0))
+
+        oi_change = float((market.get("open_interest") or {}).get("change_pct", 0.0) or 0.0)
+        if oi_change >= 3.0:
+            signals.append(Signal("Open Interest", direction, 10.0))
+
+        rvol = float((market.get("volume") or {}).get("rvol", 0.0) or 0.0)
+        if rvol >= 3.0:
+            signals.append(Signal("Relative Volume", direction, 10.0))
+
+        fvg = market.get("fvg") or {}
+        if fvg.get("active") and str(fvg.get("bias", "")).upper() in {"BULLISH", "BEARISH"}:
+            signals.append(Signal("Fair Value Gap", str(fvg["bias"]).upper(), 5.0))
+
+        order_blocks = market.get("order_blocks") or {}
+        if order_blocks.get("active") and str(order_blocks.get("bias", "")).upper() in {"BULLISH", "BEARISH"}:
+            signals.append(Signal("Order Block", str(order_blocks["bias"]).upper(), 5.0))
+
+        return self._engine.analyze(signals)
 from dataclasses import dataclass
 from typing import Any
 

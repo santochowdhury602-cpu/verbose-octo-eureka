@@ -60,6 +60,21 @@ class ConfluenceResult:
     conflicts: list[str] = field(
         default_factory=list
     )
+    @property
+    def approved(self) -> bool:
+        return self.status == "TRADE_CANDIDATE"
+
+    @property
+    def blockers(self) -> list[str]:
+        return list(self.conflicts) if not self.approved else []
+
+    @property
+    def components(self) -> dict[str, float]:
+        return {
+            signal.name: signal.score
+            for signal in self.signals
+            if signal.active
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {

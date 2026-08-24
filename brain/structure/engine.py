@@ -151,6 +151,16 @@ class MarketStructureEngine:
 
         self.swing_strength = swing_strength
 
+    @staticmethod
+    def _visible_candles(candles, as_of):
+        if as_of is None:
+            return candles
+        return [
+            candle for candle in candles
+            if candle.get("event_time", candle.get("timestamp")) is None
+            or float(candle.get("event_time", candle.get("timestamp"))) <= as_of
+        ]
+
     # =========================================================
 
     # SWINGS
@@ -162,8 +172,11 @@ class MarketStructureEngine:
         self,
 
         candles: list[dict[str, Any]],
+        as_of: float | None = None,
 
     ) -> list[SwingPoint]:
+
+        candles = self._visible_candles(candles, as_of)
 
         s = self.swing_strength
 
@@ -272,8 +285,11 @@ class MarketStructureEngine:
         self,
 
         candles: list[dict[str, Any]],
+        as_of: float | None = None,
 
     ) -> StructureResult:
+
+        candles = self._visible_candles(candles, as_of)
 
         swings = self.detect_swings(candles)
 

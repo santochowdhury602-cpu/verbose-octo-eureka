@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 
@@ -63,6 +64,17 @@ class APEXDecisionBrain:
         context: Any,
     ) -> BrainDecision:
 
+        quality = getattr(context, "data_quality", "OK")
+        quality_status = getattr(quality, "status", quality)
+        if quality_status != "OK":
+            return BrainDecision(
+                action="WAIT",
+                confidence=0.0,
+                levels=DecisionLevels(),
+                reasons=[f"Market data quality is {quality_status}"],
+                invalidation=["Valid, complete, non-stale market data required"],
+            )
+
         bias = str(
             getattr(context, "bias", "WAIT")
         ).upper()
@@ -78,6 +90,15 @@ class APEXDecisionBrain:
                 0.0,
             )
         )
+
+        if not isfinite(score) or not isfinite(price) or price <= 0:
+            return BrainDecision(
+                action="WAIT",
+                confidence=0.0,
+                levels=DecisionLevels(),
+                reasons=["Market context contains invalid numeric data"],
+                invalidation=["Finite positive price and score required"],
+            )
 
         if bias not in {"LONG", "SHORT"}:
             return BrainDecision(

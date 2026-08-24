@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import floor, isfinite
+from time import time
 from typing import Any
 
 
@@ -12,6 +14,12 @@ class RiskConfig:
     max_concurrent_positions: int = 2
     daily_drawdown_kill_pct: float = 3.0
     minimum_confidence: float = 75.0
+    fee_rate_pct: float = 0.0
+    slippage_pct: float = 0.0
+    contract_multiplier: float = 1.0
+    quantity_step: float = 0.0
+    minimum_quantity: float = 0.0
+    maximum_spread_pct: float = 100.0
 
 
 @dataclass
@@ -42,28 +50,90 @@ class RiskGate:
     def __init__(
         self,
         config: RiskConfig | None = None,
+        *,
+        account_size: float | None = None,
+        risk_per_trade_pct: float | None = None,
+        max_leverage: float | None = None,
+        max_concurrent_positions: int | None = None,
+        daily_drawdown_kill_pct: float | None = None,
+        min_confidence: float | None = None,
     ) -> None:
 
-        self.config = config or RiskConfig()
+        if config is not None and any(
+            value is not None
+            for value in (
+                account_size,
+                risk_per_trade_pct,
+                max_leverage,
+                max_concurrent_positions,
+                daily_drawdown_kill_pct,
+                min_confidence,
+            )
+        ):
+            raise ValueError("Use config or keyword risk settings, not both")
+
+        self.config = config or RiskConfig(
+            account_size=account_size if account_size is not None else 500.0,
+            risk_per_trade_pct=risk_per_trade_pct if risk_per_trade_pct is not None else 1.0,
+            max_leverage=max_leverage if max_leverage is not None else 5.0,
+            max_concurrent_positions=max_concurrent_positions if max_concurrent_positions is not None else 2,
+            daily_drawdown_kill_pct=daily_drawdown_kill_pct if daily_drawdown_kill_pct is not None else 3.0,
+            minimum_confidence=min_confidence if min_confidence is not None else 75.0,
+        )
+        self._validate_config()
 
         # Persistent kill switch.
         self._killed = False
+        self._audit: list[dict[str, Any]] = []
+
+    def _validate_config(self) -> None:
+        numeric = (
+            self.config.account_size,
+            self.config.risk_per_trade_pct,
+            self.config.max_leverage,
+            self.config.daily_drawdown_kill_pct,
+            self.config.minimum_confidence,
+            self.config.fee_rate_pct,
+            self.config.slippage_pct,
+            self.config.contract_multiplier,
+            self.config.maximum_spread_pct,
+        )
+        if not all(isfinite(float(value)) for value in numeric):
+            raise ValueError("Risk configuration must be finite")
+        if self.config.account_size <= 0 or self.config.risk_per_trade_pct <= 0:
+            raise ValueError("Account size and risk percentage must be positive")
+        if self.config.max_leverage <= 0 or self.config.contract_multiplier <= 0:
+            raise ValueError("Leverage and contract multiplier must be positive")
+        if self.config.max_concurrent_positions < 0 or self.config.daily_drawdown_kill_pct < 0:
+            raise ValueError("Position and drawdown limits cannot be negative")
+        if self.config.fee_rate_pct < 0 or self.config.slippage_pct < 0:
+            raise ValueError("Fees and slippage cannot be negative")
+        if self.config.quantity_step < 0 or self.config.minimum_quantity < 0:
+            raise ValueError("Quantity constraints cannot be negative")
 
     # =========================================================
     # KILL SWITCH
     # =========================================================
 
     def kill(self) -> None:
-        """Permanently reject new trades until a new gate is created."""
+        """Latch the gate and record the safety transition."""
         self._killed = True
+        self._audit.append({"state": "KILLED", "timestamp": time()})
 
-    def reset(self) -> None:
-        """Reset the in-memory kill switch."""
+    def reset(self, *, confirm: bool = False, reason: str = "") -> None:
+        """Require explicit intent and an audit reason to re-enable trading."""
+        if not confirm or not reason.strip():
+            raise ValueError("Kill-switch reset requires confirm=True and a reason")
         self._killed = False
+        self._audit.append({"state": "RESET", "timestamp": time(), "reason": reason})
 
     @property
     def killed(self) -> bool:
         return self._killed
+
+    @property
+    def audit_log(self) -> list[dict[str, Any]]:
+        return list(self._audit)
 
     # =========================================================
     # INTERNAL EVALUATOR
@@ -79,10 +149,25 @@ class RiskGate:
         leverage: float,
         open_positions: int,
         daily_drawdown_pct: float,
+        data_quality: str,
+        spread_pct: float | None,
+        available_liquidity: float | None,
     ) -> RiskResult:
 
         reasons: list[str] = []
         rejected: list[str] = []
+
+        values = (confidence, entry, leverage, open_positions, daily_drawdown_pct)
+        if not all(isfinite(float(value)) for value in values):
+            rejected.append("Risk inputs must be finite")
+        if stop_loss is not None and not isfinite(float(stop_loss)):
+            rejected.append("Stop-loss must be finite")
+        if data_quality != "OK":
+            rejected.append(f"Market data quality is {data_quality}")
+        if spread_pct is not None and (not isfinite(spread_pct) or spread_pct > self.config.maximum_spread_pct):
+            rejected.append("Market spread exceeds configured maximum")
+        if available_liquidity is not None and (not isfinite(available_liquidity) or available_liquidity <= 0):
+            rejected.append("Insufficient market liquidity")
 
         risk_usd = (
             self.config.account_size
@@ -242,10 +327,20 @@ class RiskGate:
             and abs(entry - stop_loss) > 0
         ):
 
-            position_size = (
-                risk_usd
-                / abs(entry - stop_loss)
+            effective_distance = abs(entry - stop_loss)
+            effective_distance += entry * (
+                2 * self.config.fee_rate_pct / 100
+                + self.config.slippage_pct / 100
             )
+            position_size = risk_usd / (
+                effective_distance * self.config.contract_multiplier
+            )
+            if self.config.quantity_step > 0:
+                position_size = floor(position_size / self.config.quantity_step) * self.config.quantity_step
+                position_size = round(position_size, 12)
+            if position_size < self.config.minimum_quantity:
+                rejected.append("Calculated position size is below minimum quantity")
+                position_size = 0.0
 
         return RiskResult(
             approved=approved,
@@ -297,6 +392,9 @@ class RiskGate:
         # Legacy parameter names.
         current_positions: int | None = None,
         requested_leverage: float | None = None,
+        data_quality: str = "OK",
+        spread_pct: float | None = None,
+        available_liquidity: float | None = None,
     ) -> RiskResult:
         """
         Supports both the original APEX API and the newer API.
@@ -394,8 +492,11 @@ class RiskGate:
             entry=float(entry),
             stop_loss=stop_loss,
             leverage=float(leverage),
-            open_positions=int(open_positions),
+            open_positions=open_positions,
             daily_drawdown_pct=float(
                 daily_drawdown_pct
             ),
+            data_quality=data_quality,
+            spread_pct=spread_pct,
+            available_liquidity=available_liquidity,
         )
