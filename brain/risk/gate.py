@@ -5,6 +5,8 @@ from math import floor, isfinite
 from time import time
 from typing import Any
 
+from brain.context import ExchangeMetadata
+
 
 @dataclass(frozen=True)
 class RiskConfig:
@@ -152,6 +154,7 @@ class RiskGate:
         data_quality: str,
         spread_pct: float | None,
         available_liquidity: float | None,
+        exchange_metadata: ExchangeMetadata | None,
     ) -> RiskResult:
 
         reasons: list[str] = []
@@ -332,13 +335,17 @@ class RiskGate:
                 2 * self.config.fee_rate_pct / 100
                 + self.config.slippage_pct / 100
             )
-            position_size = risk_usd / (
-                effective_distance * self.config.contract_multiplier
-            )
-            if self.config.quantity_step > 0:
-                position_size = floor(position_size / self.config.quantity_step) * self.config.quantity_step
+            multiplier = exchange_metadata.contract_multiplier if exchange_metadata else self.config.contract_multiplier
+            quantity_step = exchange_metadata.quantity_step if exchange_metadata else self.config.quantity_step
+            minimum_quantity = exchange_metadata.minimum_quantity if exchange_metadata else self.config.minimum_quantity
+            maximum_quantity = exchange_metadata.maximum_quantity if exchange_metadata else None
+            position_size = risk_usd / (effective_distance * multiplier)
+            if quantity_step > 0:
+                position_size = floor(position_size / quantity_step) * quantity_step
                 position_size = round(position_size, 12)
-            if position_size < self.config.minimum_quantity:
+            if maximum_quantity is not None and position_size > maximum_quantity:
+                position_size = maximum_quantity
+            if position_size < minimum_quantity:
                 rejected.append("Calculated position size is below minimum quantity")
                 position_size = 0.0
 
@@ -395,6 +402,7 @@ class RiskGate:
         data_quality: str = "OK",
         spread_pct: float | None = None,
         available_liquidity: float | None = None,
+        exchange_metadata: ExchangeMetadata | None = None,
     ) -> RiskResult:
         """
         Supports both the original APEX API and the newer API.
@@ -499,4 +507,5 @@ class RiskGate:
             data_quality=data_quality,
             spread_pct=spread_pct,
             available_liquidity=available_liquidity,
+            exchange_metadata=exchange_metadata,
         )

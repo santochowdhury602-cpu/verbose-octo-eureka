@@ -12,6 +12,15 @@ class MTFStructureResult:
     timeframes: dict[str, dict[str, Any]]
 
     reasons: list[str]
+    htf_bias: str = "WAIT"
+    mtf_bias: str = "WAIT"
+    ltf_bias: str = "WAIT"
+    alignment_score: float = 0.0
+    conflict: bool = False
+    regime: str = "RANGE"
+    confidence: float = 0.0
+    stale: bool = False
+    stale_timeframes: list[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -19,6 +28,15 @@ class MTFStructureResult:
             "aligned": self.aligned,
             "timeframes": self.timeframes,
             "reasons": self.reasons,
+            "htf_bias": self.htf_bias,
+            "mtf_bias": self.mtf_bias,
+            "ltf_bias": self.ltf_bias,
+            "alignment_score": self.alignment_score,
+            "conflict": self.conflict,
+            "regime": self.regime,
+            "confidence": self.confidence,
+            "stale": self.stale,
+            "stale_timeframes": self.stale_timeframes or [],
         }
 
 
@@ -39,6 +57,8 @@ class MultiTimeframeStructure:
             str,
             list[dict[str, Any]]
         ],
+        as_of: float | None = None,
+        timeframe_metadata: dict[str, dict[str, float]] | None = None,
     ) -> MTFStructureResult:
 
         results: dict[
@@ -46,17 +66,29 @@ class MultiTimeframeStructure:
             dict[str, Any]
         ] = {}
 
-        bullish = 0
-        bearish = 0
+        hierarchy = {
+            "4h": "htf", "1h": "htf",
+            "15m": "mtf", "5m": "mtf",
+            "1m": "ltf",
+        }
+        biases = {"htf": [], "mtf": [], "ltf": []}
 
         reasons: list[str] = []
+        stale_timeframes = []
+        for timeframe, metadata in (timeframe_metadata or {}).items():
+            latest = metadata.get("latest_event_time")
+            interval = metadata.get("expected_interval")
+            threshold = metadata.get("stale_threshold", interval * 2 if interval else 0)
+            if as_of is not None and latest is not None and threshold and as_of - latest > threshold:
+                stale_timeframes.append(timeframe)
 
         for timeframe, candles in (
             candles_by_timeframe.items()
         ):
 
             result = self.engine.analyze(
-                candles
+                candles,
+                as_of=as_of,
             )
 
             data = result.to_dict()
@@ -66,24 +98,29 @@ class MultiTimeframeStructure:
             ] = data
 
             if result.bias == "LONG":
-
-                bullish += 1
+                biases[hierarchy.get(timeframe.lower(), "mtf")].append("LONG")
 
             elif result.bias == "SHORT":
+                biases[hierarchy.get(timeframe.lower(), "mtf")].append("SHORT")
 
-                bearish += 1
+        def group_bias(values):
+            if not values or values.count("LONG") == values.count("SHORT"):
+                return "WAIT"
+            return "LONG" if values.count("LONG") > values.count("SHORT") else "SHORT"
 
-        if bullish > bearish:
+        htf_bias = group_bias(biases["htf"])
+        mtf_bias = group_bias(biases["mtf"])
+        ltf_bias = group_bias(biases["ltf"])
+        group_values = [htf_bias, mtf_bias, ltf_bias]
+        active_biases = [value for value in group_values if value != "WAIT"]
+        conflict = len(set(active_biases)) > 1
+        weights = {"htf": 3, "mtf": 2, "ltf": 1}
+        weighted_total = sum(weights[name] for name, value in (("htf", htf_bias), ("mtf", mtf_bias), ("ltf", ltf_bias)) if value != "WAIT")
+        winning = htf_bias if htf_bias != "WAIT" else mtf_bias if mtf_bias != "WAIT" else ltf_bias
+        weighted_winning = sum(weights[name] for name, value in (("htf", htf_bias), ("mtf", mtf_bias), ("ltf", ltf_bias)) if value == winning)
+        alignment_score = 100.0 * weighted_winning / weighted_total if weighted_total else 0.0
 
-            bias = "LONG"
-
-        elif bearish > bullish:
-
-            bias = "SHORT"
-
-        else:
-
-            bias = "WAIT"
+        bias = winning if winning != "WAIT" and not (conflict and htf_bias == "WAIT") else "WAIT"
 
         active = [
             x for x in results.values()
@@ -102,9 +139,7 @@ class MultiTimeframeStructure:
                 for x in active
             }
 
-            aligned = (
-                len(active_biases) == 1
-            )
+            aligned = len(active_biases) == 1
 
         if aligned:
 
@@ -118,9 +153,21 @@ class MultiTimeframeStructure:
                 "Multi-timeframe structure not fully aligned"
             )
 
+        if conflict:
+            reasons.append("Higher and lower timeframe structure conflict")
+
         return MTFStructureResult(
             bias=bias,
             aligned=aligned,
             timeframes=results,
             reasons=reasons,
+            htf_bias=htf_bias,
+            mtf_bias=mtf_bias,
+            ltf_bias=ltf_bias,
+            alignment_score=round(alignment_score, 2),
+            conflict=conflict,
+            regime=htf_bias if htf_bias != "WAIT" else "RANGE",
+            confidence=round(alignment_score, 2),
+            stale=bool(stale_timeframes),
+            stale_timeframes=stale_timeframes,
         )

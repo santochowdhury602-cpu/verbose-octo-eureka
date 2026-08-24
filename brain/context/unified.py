@@ -97,6 +97,24 @@ class DataQuality:
 
 
 @dataclass(frozen=True)
+class ExchangeMetadata:
+    symbol: str
+    tick_size: float
+    quantity_step: float
+    minimum_quantity: float
+    maximum_quantity: float | None = None
+    contract_multiplier: float = 1.0
+    price_precision: int | None = None
+    quantity_precision: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.tick_size <= 0 or self.quantity_step <= 0 or self.minimum_quantity < 0 or self.contract_multiplier <= 0:
+            raise ValueError("Invalid exchange quantity or price metadata")
+        if self.maximum_quantity is not None and self.maximum_quantity < self.minimum_quantity:
+            raise ValueError("maximum_quantity cannot be below minimum_quantity")
+
+
+@dataclass(frozen=True)
 class PriceContext:
     symbol: str
     price: float
@@ -105,8 +123,8 @@ class PriceContext:
 
     change_pct: float = 0.0
 
-    volume: float = 0.0
-    volume_ratio: float = 1.0
+    volume: float | None = None
+    volume_ratio: float | None = None
 
     atr: float | None = None
 
@@ -127,9 +145,13 @@ class PriceContext:
         if _finite(self.price, "price") <= 0:
             raise ValueError("price must be positive")
         for name in ("change_pct", "volume", "volume_ratio"):
-            _finite(getattr(self, name), name)
-        if self.volume < 0 or self.volume_ratio < 0:
-            raise ValueError("volume values must be non-negative")
+            value = getattr(self, name)
+            if value is not None:
+                _finite(value, name)
+        if self.volume is not None and self.volume < 0:
+            raise ValueError("volume must be non-negative")
+        if self.volume_ratio is not None and self.volume_ratio < 0:
+            raise ValueError("volume_ratio must be non-negative")
         if self.atr is not None and _finite(self.atr, "atr") < 0:
             raise ValueError("atr must be non-negative")
 
@@ -144,10 +166,11 @@ class MarketContext:
     """
 
     price: PriceContext
+    exchange: str = ""
 
-    confluence: ConfluenceResult
+    confluence: ConfluenceResult | None = None
 
-    oi: OIAnalysis
+    oi: OIAnalysis | None = None
 
     orderflow: Any | None = None
     liquidity: Any | None = None
@@ -161,7 +184,8 @@ class MarketContext:
     trades: tuple[Trade, ...] = ()
     delta: float = 0.0
     cvd: float = 0.0
-    oi_change: float = 0.0
+    oi_change: float | None = None
+    open_interest: float | None = None
     funding: float | None = None
     vwap: float | None = None
     volatility: float | None = None
@@ -172,6 +196,7 @@ class MarketContext:
     received_time: float | None = None
     calculation_time: float | None = None
     data_quality: DataQuality = field(default_factory=DataQuality)
+    exchange_metadata: ExchangeMetadata | None = None
 
     metadata: dict[str, Any] = field(
         default_factory=dict
@@ -183,7 +208,9 @@ class MarketContext:
             if value is not None:
                 _finite(value, name)
         for name in ("delta", "cvd", "oi_change"):
-            _finite(getattr(self, name), name)
+            value = getattr(self, name)
+            if value is not None:
+                _finite(value, name)
         for name in ("funding", "vwap", "volatility"):
             value = getattr(self, name)
             if value is not None:
@@ -201,24 +228,25 @@ class MarketContext:
 
     @property
     def bias(self) -> str:
-        return self.confluence.bias
+        return self.confluence.bias if self.confluence else "WAIT"
 
     @property
     def score(self) -> float:
-        return self.confluence.score
+        return self.confluence.score if self.confluence else 0.0
 
     @property
     def regime(self) -> str:
-        return self.oi.regime
+        return self.oi.regime if self.oi else self.market_regime
 
     @property
     def oi_direction(self) -> str:
-        return self.oi.direction
+        return self.oi.direction if self.oi else "UNKNOWN"
 
     @property
     def trade_candidate(self) -> bool:
         return (
-            self.confluence.status
+            self.confluence is not None
+            and self.confluence.status
             == "TRADE_CANDIDATE"
         )
 
@@ -270,6 +298,7 @@ class MarketContext:
 
         return {
             "symbol": self.symbol,
+            "exchange": self.exchange,
             "price": serialize(self.price),
             "confluence": serialize(
                 self.confluence
@@ -293,6 +322,7 @@ class MarketContext:
             "delta": self.delta,
             "cvd": self.cvd,
             "oi_change": self.oi_change,
+            "open_interest": self.open_interest,
             "funding": self.funding,
             "vwap": self.vwap,
             "volatility": self.volatility,
@@ -304,6 +334,7 @@ class MarketContext:
             "received_time": self.received_time,
             "calculation_time": self.calculation_time,
             "data_quality": serialize(self.data_quality),
+            "exchange_metadata": serialize(self.exchange_metadata),
             "metadata": serialize(
                 self.metadata
             ),
@@ -330,6 +361,7 @@ class MarketContextBuilder:
             price=price,
             timeframe=timeframe,
         )
+        self._exchange = ""
 
         self._confluence: ConfluenceResult | None = None
         self._oi: OIAnalysis | None = None
@@ -343,7 +375,8 @@ class MarketContextBuilder:
         self._trades: tuple[Trade, ...] = ()
         self._delta = 0.0
         self._cvd = 0.0
-        self._oi_change = 0.0
+        self._oi_change: float | None = None
+        self._open_interest: float | None = None
         self._funding: float | None = None
         self._vwap: float | None = None
         self._volatility: float | None = None
@@ -351,6 +384,7 @@ class MarketContextBuilder:
         self._microstructure: Any | None = None
         self._mtf: Any | None = None
         self._data_quality = DataQuality()
+        self._exchange_metadata: ExchangeMetadata | None = None
 
         self._timestamp: float | None = None
         self._event_time: float | None = None
@@ -394,6 +428,12 @@ class MarketContextBuilder:
             ),
         )
 
+        return self
+
+    def set_exchange(self, exchange: str) -> "MarketContextBuilder":
+        if not exchange:
+            raise ValueError("exchange is required")
+        self._exchange = exchange.upper()
         return self
 
     def set_confluence(
@@ -452,7 +492,8 @@ class MarketContextBuilder:
         trades: tuple[Trade, ...] = (),
         delta: float = 0.0,
         cvd: float = 0.0,
-        oi_change: float = 0.0,
+        oi_change: float | None = None,
+        open_interest: float | None = None,
         funding: float | None = None,
         vwap: float | None = None,
         volatility: float | None = None,
@@ -464,6 +505,7 @@ class MarketContextBuilder:
         self._delta = delta
         self._cvd = cvd
         self._oi_change = oi_change
+        self._open_interest = open_interest
         self._funding = funding
         self._vwap = vwap
         self._volatility = volatility
@@ -486,6 +528,12 @@ class MarketContextBuilder:
         reason: str = "",
     ) -> "MarketContextBuilder":
         self._data_quality = DataQuality(status, reason)
+        return self
+
+    def set_exchange_metadata(self, metadata: ExchangeMetadata) -> "MarketContextBuilder":
+        if metadata.symbol != self._price.symbol:
+            raise ValueError("Exchange metadata symbol does not match context")
+        self._exchange_metadata = metadata
         return self
 
     def set_timestamp(
@@ -517,20 +565,21 @@ class MarketContextBuilder:
         self._calculation_time = calculation_time
         return self
 
-    def build(self) -> MarketContext:
+    def build(self, *, allow_incomplete: bool = False) -> MarketContext:
 
-        if self._confluence is None:
+        if self._confluence is None and not allow_incomplete:
             raise ValueError(
                 "Confluence result is required"
             )
 
-        if self._oi is None:
+        if self._oi is None and not allow_incomplete:
             raise ValueError(
                 "OI analysis is required"
             )
 
         return MarketContext(
             price=self._price,
+            exchange=self._exchange,
             confluence=self._confluence,
             oi=self._oi,
             orderflow=self._orderflow,
@@ -547,6 +596,7 @@ class MarketContextBuilder:
             delta=self._delta,
             cvd=self._cvd,
             oi_change=self._oi_change,
+            open_interest=self._open_interest,
             funding=self._funding,
             vwap=self._vwap,
             volatility=self._volatility,
@@ -554,5 +604,6 @@ class MarketContextBuilder:
             microstructure=self._microstructure,
             mtf=self._mtf,
             data_quality=self._data_quality,
+            exchange_metadata=self._exchange_metadata,
             metadata=dict(self._metadata),
         )

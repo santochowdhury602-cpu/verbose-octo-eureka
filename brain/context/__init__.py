@@ -1,6 +1,7 @@
 from .unified import (
     Candle,
     DataQuality,
+    ExchangeMetadata,
     MarketContext,
     MarketContextBuilder,
     OrderBook,
@@ -23,5 +24,6 @@ __all__ = [
     "Trade",
     "OrderBook",
     "DataQuality",
+    "ExchangeMetadata",
     "build_context",
 ]

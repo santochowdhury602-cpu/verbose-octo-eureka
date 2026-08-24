@@ -65,7 +65,7 @@ class LiveMarketSnapshot:
                 )[-5000:]
             )
 
-    def build(self) -> MarketState | None:
+    def build(self, calculation_time: float | None = None) -> MarketState | None:
 
         data = self.feed.data
 
@@ -88,7 +88,7 @@ class LiveMarketSnapshot:
         )
 
         rolling = self.rolling.snapshot()
-        quality, quality_reason = data.quality()
+        quality, quality_reason = data.quality(now=calculation_time)
 
         return MarketState(
 
