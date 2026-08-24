@@ -1,1 +1,1 @@
-# verbose-octo-eureka
+# Cursor
