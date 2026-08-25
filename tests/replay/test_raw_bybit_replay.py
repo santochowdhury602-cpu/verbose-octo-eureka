@@ -41,6 +41,41 @@ def test_raw_replay_is_deterministic():
     assert first["context"]["exchange"] == "BYBIT"
 
 
+def test_raw_replay_covers_complete_bybit_market_fixture():
+    events = raw_fixture()
+    events.insert(1, event(1.5, "kline.5.BTCUSDT", [{
+        "start": "1000", "open": "100", "high": "102", "low": "99",
+        "close": "101", "volume": "25", "confirm": True,
+    }]))
+    events.append(event(22, "tickers.BTCUSDT", {
+        "lastPrice": "101", "volume24h": "2500", "openInterest": "100", "fundingRate": "0.001",
+    }))
+    first = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    second = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    assert first == second
+    assert first["context"]["metadata"]["candles_by_timeframe"]["5m"]
+    assert first["context"]["metadata"]["volume_24h"] == 2500.0
+
+
+def test_raw_replay_normalizes_live_htf_intervals_deterministically():
+    events = raw_fixture() + [
+        event(22, "tickers.BTCUSDT", {"lastPrice": "101"}),
+        event(23, "kline.60.BTCUSDT", [{
+            "start": "23000", "open": "100", "high": "102", "low": "99", "close": "101", "volume": "10",
+        }]),
+        event(24, "kline.240.BTCUSDT", [{
+            "start": "24000", "open": "100", "high": "103", "low": "98", "close": "102", "volume": "20",
+        }]),
+    ]
+    first = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    second = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    assert first == second
+    assert "1h" in first["context"]["metadata"]["candles_by_timeframe"]
+    assert "4h" in first["context"]["metadata"]["candles_by_timeframe"]
+    assert first["context"]["mtf"]["timeframes"]["1h"]
+    assert first["context"]["mtf"]["timeframes"]["4h"]
+
+
 def test_raw_replay_negative_events_never_trade():
     cases = [
         raw_fixture()[:-1] + [event(21, "tickers.BTCUSDT", {"openInterest": "100"})],
@@ -83,3 +118,66 @@ def test_raw_replay_stale_timeframe_is_not_actionable():
         },
     ).run(pipeline())
     assert result.pipeline_result.decision.action == "WAIT"
+
+
+def test_raw_replay_calculates_volume_intelligence_deterministically():
+    events = [event(1, "orderbook.50.BTCUSDT", {"u": 1, "b": [[99, 2]], "a": [[101, 2]]}, "snapshot")]
+    for timestamp in range(2, 24):
+        events.append(event(timestamp, "kline.1.BTCUSDT", [{
+            "start": timestamp * 1000,
+            "open": "100", "high": "101", "low": "99", "close": "100",
+            "volume": str(10 if timestamp < 23 else 40), "confirm": True,
+        }]))
+    events.extend([
+        event(24, "publicTrade.BTCUSDT", [{"i": "volume-trade", "T": 24000, "p": "100", "v": "1", "S": "Buy"}]),
+        event(25, "tickers.BTCUSDT", {"lastPrice": "100", "openInterest": "100", "fundingRate": "0.001"}),
+    ])
+    first = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    second = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    assert first == second
+    assert first["context"]["rvol"]["rvol"] == 4.0
+    assert first["context"]["volume_profile"]["poc"] is not None
+
+
+def test_complete_raw_replay_covers_all_pipeline_inputs_deterministically():
+    events = [event(1, "orderbook.50.BTCUSDT", {"u": 1, "b": [[99, 2]], "a": [[101, 2]]}, "snapshot")]
+    for timestamp in range(2, 24):
+        events.append(event(timestamp, "kline.1.BTCUSDT", [{
+            "start": timestamp * 1000,
+            "open": "100", "high": "101", "low": "99", "close": "100",
+            "volume": "10", "confirm": True,
+        }]))
+    events.extend([
+        event(24, "kline.5.BTCUSDT", [{
+            "start": "24000", "open": "100", "high": "102", "low": "99", "close": "101",
+            "volume": "25", "confirm": True,
+        }]),
+        event(25, "kline.60.BTCUSDT", [{
+            "start": "25000", "open": "100", "high": "103", "low": "98", "close": "102",
+            "volume": "30", "confirm": True,
+        }]),
+        event(26, "kline.240.BTCUSDT", [{
+            "start": "26000", "open": "100", "high": "104", "low": "97", "close": "103",
+            "volume": "40", "confirm": True,
+        }]),
+        event(27, "publicTrade.BTCUSDT", [{"i": "complete-trade", "T": 27000, "p": "103", "v": "1", "S": "Buy"}]),
+        event(28, "tickers.BTCUSDT", {
+            "lastPrice": "103", "volume24h": "2500", "openInterest": "100", "fundingRate": "0.001",
+        }),
+    ])
+    first = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    second = RawBybitReplayHarness(events).run(pipeline()).to_dict()
+    assert first == second
+    assert first["context"]["rvol"]["sample_count"] == 20
+    assert first["context"]["volume_profile"]["approximation"].startswith("OHLCV typical-price")
+    assert first["context"]["metadata"]["candles_by_timeframe"]["5m"]
+    assert first["context"]["metadata"]["candles_by_timeframe"]["1h"]
+    assert first["context"]["metadata"]["candles_by_timeframe"]["4h"]
+    assert first["context"]["metadata"]["volume_24h"] == 2500.0
+    assert first["context"]["confluence"] is not None
+    assert first["decision"] is not None
+    assert first["risk"] is not None
+    assert first["intent"] is None or (
+        first["intent"]["paper_only"]
+        and first["intent"]["metadata"]["execution_mode"] == "PAPER_ONLY"
+    )

@@ -1,6 +1,5 @@
 from collections import deque
 from dataclasses import dataclass
-from time import time
 
 
 @dataclass
@@ -33,9 +32,10 @@ class RollingOrderFlow:
             )
         )
 
-    def calculate(self, seconds: int) -> RollingFlow:
+    def calculate(self, seconds: int, as_of: float | None = None) -> RollingFlow:
 
-        cutoff = time() - seconds
+        cutoff = (max(timestamp for timestamp, _, _ in self.trades) if self.trades else 0.0) if as_of is None else as_of
+        cutoff -= seconds
 
         buy = 0.0
         sell = 0.0
@@ -62,9 +62,9 @@ class RollingOrderFlow:
             buy_ratio=ratio,
         )
 
-    def snapshot(self) -> dict[int, RollingFlow]:
+    def snapshot(self, as_of: float | None = None) -> dict[int, RollingFlow]:
 
         return {
-            window: self.calculate(window)
+            window: self.calculate(window, as_of=as_of)
             for window in self.windows
         }

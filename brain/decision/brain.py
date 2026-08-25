@@ -117,7 +117,7 @@ class APEXDecisionBrain:
 
         quality = getattr(context, "data_quality", "OK")
         quality_status = getattr(quality, "status", quality)
-        if quality_status != "OK":
+        if quality_status not in {"OK", "DATA_VALID"}:
             return BrainDecision(
                 action="WAIT",
                 confidence=0.0,

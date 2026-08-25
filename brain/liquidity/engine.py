@@ -636,8 +636,16 @@ class LiquidityEngine:
         self,
 
         candles: list[dict[str, Any]],
+        as_of: float | None = None,
 
     ) -> LiquidityResult:
+
+        if as_of is not None:
+            candles = [
+                candle for candle in candles
+                if candle.get("event_time", candle.get("timestamp")) is None
+                or float(candle.get("event_time", candle.get("timestamp"))) <= as_of
+            ]
 
         if not candles:
 

@@ -85,6 +85,15 @@ class OrderBook:
             return None
         return self.ask - self.bid
 
+    @property
+    def imbalance(self) -> float:
+        bid_volume = sum(price * quantity for price, quantity in self.bids)
+        ask_volume = sum(price * quantity for price, quantity in self.asks)
+        total = bid_volume + ask_volume
+        if total <= 0:
+            return 0.0
+        return max(-1.0, min(1.0, (bid_volume - ask_volume) / total))
+
 
 @dataclass(frozen=True)
 class DataQuality:
@@ -92,7 +101,7 @@ class DataQuality:
     reason: str = ""
 
     def __post_init__(self) -> None:
-        if self.status not in {"OK", "DATA_INVALID", "DATA_STALE", "DATA_INCOMPLETE"}:
+        if self.status not in {"OK", "DATA_VALID", "DATA_INVALID", "DATA_STALE", "DATA_INCOMPLETE"}:
             raise ValueError(f"Invalid data quality status: {self.status}")
 
 
@@ -121,7 +130,7 @@ class PriceContext:
 
     timeframe: str = "5m"
 
-    change_pct: float = 0.0
+    change_pct: float | None = 0.0
 
     volume: float | None = None
     volume_ratio: float | None = None
@@ -189,6 +198,9 @@ class MarketContext:
     funding: float | None = None
     vwap: float | None = None
     volatility: float | None = None
+    volatility_regime: str = "UNKNOWN"
+    rvol: Any | None = None
+    volume_profile: Any | None = None
     market_regime: str = "unknown"
     microstructure: Any | None = None
     mtf: Any | None = None
@@ -326,6 +338,9 @@ class MarketContext:
             "funding": self.funding,
             "vwap": self.vwap,
             "volatility": self.volatility,
+            "volatility_regime": self.volatility_regime,
+            "rvol": serialize(self.rvol),
+            "volume_profile": serialize(self.volume_profile),
             "market_regime": self.market_regime,
             "microstructure": serialize(self.microstructure),
             "mtf": serialize(self.mtf),
@@ -380,6 +395,8 @@ class MarketContextBuilder:
         self._funding: float | None = None
         self._vwap: float | None = None
         self._volatility: float | None = None
+        self._rvol: Any | None = None
+        self._volume_profile: Any | None = None
         self._market_regime = "unknown"
         self._microstructure: Any | None = None
         self._mtf: Any | None = None
@@ -428,6 +445,18 @@ class MarketContextBuilder:
             ),
         )
 
+        return self
+
+    def set_price_change_pct(self, change_pct: float | None) -> "MarketContextBuilder":
+        self._price = PriceContext(
+            symbol=self._price.symbol,
+            price=self._price.price,
+            timeframe=self._price.timeframe,
+            change_pct=change_pct,
+            volume=self._price.volume,
+            volume_ratio=self._price.volume_ratio,
+            atr=self._price.atr,
+        )
         return self
 
     def set_exchange(self, exchange: str) -> "MarketContextBuilder":
@@ -497,6 +526,8 @@ class MarketContextBuilder:
         funding: float | None = None,
         vwap: float | None = None,
         volatility: float | None = None,
+        rvol: Any | None = None,
+        volume_profile: Any | None = None,
         market_regime: str = "unknown",
     ) -> "MarketContextBuilder":
         self._candles = tuple(candles)
@@ -509,6 +540,8 @@ class MarketContextBuilder:
         self._funding = funding
         self._vwap = vwap
         self._volatility = volatility
+        self._rvol = rvol
+        self._volume_profile = volume_profile
         self._market_regime = market_regime
         return self
 
@@ -600,6 +633,8 @@ class MarketContextBuilder:
             funding=self._funding,
             vwap=self._vwap,
             volatility=self._volatility,
+            rvol=self._rvol,
+            volume_profile=self._volume_profile,
             market_regime=self._market_regime,
             microstructure=self._microstructure,
             mtf=self._mtf,

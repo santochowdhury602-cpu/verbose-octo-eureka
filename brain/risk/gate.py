@@ -155,6 +155,7 @@ class RiskGate:
         spread_pct: float | None,
         available_liquidity: float | None,
         exchange_metadata: ExchangeMetadata | None,
+        volatility_regime: str | None,
     ) -> RiskResult:
 
         reasons: list[str] = []
@@ -165,8 +166,10 @@ class RiskGate:
             rejected.append("Risk inputs must be finite")
         if stop_loss is not None and not isfinite(float(stop_loss)):
             rejected.append("Stop-loss must be finite")
-        if data_quality != "OK":
+        if data_quality not in {"OK", "DATA_VALID"}:
             rejected.append(f"Market data quality is {data_quality}")
+        if volatility_regime == "HIGH":
+            rejected.append("Volatility regime is too high for the risk policy")
         if spread_pct is not None and (not isfinite(spread_pct) or spread_pct > self.config.maximum_spread_pct):
             rejected.append("Market spread exceeds configured maximum")
         if available_liquidity is not None and (not isfinite(available_liquidity) or available_liquidity <= 0):
@@ -403,6 +406,7 @@ class RiskGate:
         spread_pct: float | None = None,
         available_liquidity: float | None = None,
         exchange_metadata: ExchangeMetadata | None = None,
+        volatility_regime: str | None = None,
     ) -> RiskResult:
         """
         Supports both the original APEX API and the newer API.
@@ -508,4 +512,5 @@ class RiskGate:
             spread_pct=spread_pct,
             available_liquidity=available_liquidity,
             exchange_metadata=exchange_metadata,
+            volatility_regime=volatility_regime,
         )

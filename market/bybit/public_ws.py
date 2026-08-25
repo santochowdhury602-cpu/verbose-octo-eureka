@@ -6,6 +6,7 @@ from math import isfinite
 from typing import Any
 
 from market.integration.oi_history import OIHistory
+from market.integration.price_history import PriceHistory
 
 try:
     import websockets
@@ -14,6 +15,15 @@ except ImportError:  # pragma: no cover - exercised in dependency-free installs
 
 
 BYBIT_PUBLIC_WS = "wss://stream.bybit.com/v5/public/linear"
+
+
+def normalize_bybit_interval(interval: str | int) -> str:
+    """Return the canonical timeframe name used by the intelligence engines."""
+    value = str(interval).upper()
+    if value == "D":
+        return "1d"
+    minutes = int(value)
+    return f"{minutes // 60}h" if minutes >= 60 and minutes % 60 == 0 else f"{minutes}m"
 
 
 @dataclass
@@ -36,15 +46,29 @@ class BybitMarketData:
     last_trade_event_time: float | None = None
     last_update: float = 0.0
     last_event_time: float | None = None
+    orderbook_event_time: float | None = None
     last_sequence: int | None = None
+    book_ready: bool = False
+    book_invalid: bool = False
     data_quality: str = "DATA_INCOMPLETE"
     quality_reason: str = "Waiting for a valid order-book snapshot"
     candles: list[dict[str, Any]] = field(default_factory=list)
+    candles_by_timeframe: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    candle_event_times: dict[str, float] = field(default_factory=dict)
+    candle_confirmed_times: dict[str, float] = field(default_factory=dict)
     open_interest: float | None = None
-    previous_open_interest: float | None = None
     oi_change_pct: float | None = None
+    oi_event_time: float | None = None
+    oi_stale: bool = True
     funding_rate: float | None = None
+    funding_event_time: float | None = None
+    funding_stale: bool = True
     volume: float | None = None
+    volume_24h: float | None = None
+    volume_24h_event_time: float | None = None
+    trade_event_time: float | None = None
+    price_change_pct: float | None = None
+    price_event_time: float | None = None
     volatility: float | None = None
 
     def _clean_book(self) -> None:
@@ -61,13 +85,26 @@ class BybitMarketData:
             if qty > 0
         }
 
-    def quality(self, max_age: float = 10.0, now: float | None = None) -> tuple[str, str]:
-        if self.data_quality != "OK":
-            return self.data_quality, self.quality_reason
+    def quality(self, max_age: float = 10.0, now: float | None = None, *, thresholds: dict[str, float] | None = None) -> tuple[str, str]:
+        if self.data_quality == "DATA_INVALID" or self.book_invalid:
+            return "DATA_INVALID", self.quality_reason
         current_time = time.time() if now is None else now
-        if self.last_update <= 0 or current_time - self.last_update > max_age:
-            return "DATA_STALE", "Market data is older than the allowed age"
-        return "OK", ""
+        limits = {"orderbook": max_age, "trade": max_age, "kline": max_age, "oi": 120.0, "funding": 120.0}
+        if thresholds:
+            limits.update(thresholds)
+        component_times = {
+            "orderbook": self.orderbook_event_time if self.book_ready else None,
+            "trade": self.trade_event_time,
+            "kline": max(self.candle_event_times.values(), default=None),
+            "oi": self.oi_event_time,
+            "funding": self.funding_event_time,
+        }
+        for name, timestamp in component_times.items():
+            if timestamp is not None and current_time - timestamp > limits[name]:
+                return "DATA_STALE", f"{name} data is stale"
+        if not self.book_ready or self.price is None or self.open_interest is None or self.funding_rate is None:
+            return "DATA_INCOMPLETE", "Required market data is unavailable"
+        return "DATA_VALID", ""
 
     def sorted_bids(self, depth: int = 50):
         return sorted(
@@ -136,11 +173,21 @@ class BybitPublicFeed:
         self,
         symbol: str = "BTCUSDT",
         orderbook_depth: int = 50,
+        stale_thresholds: dict[str, float] | None = None,
     ):
 
         self.symbol = symbol.upper()
 
         self.orderbook_depth = orderbook_depth
+        self.stale_thresholds = {
+            "orderbook": 30.0,
+            "trade": 30.0,
+            "kline": 300.0,
+            "oi": 120.0,
+            "funding": 120.0,
+        }
+        if stale_thresholds:
+            self.stale_thresholds.update(stale_thresholds)
 
         self.data = BybitMarketData(
             symbol=self.symbol
@@ -150,32 +197,26 @@ class BybitPublicFeed:
 
         self._trade_sequence = 0
         self.oi_history = OIHistory()
+        self.price_history = PriceHistory()
 
     def _reset_state(self) -> None:
+        """Invalidate only the book on reconnect; historical observations remain safe."""
         self.data.bids.clear()
         self.data.asks.clear()
-        self.data.trades.clear()
-        self.data.price = None
-        self.data.last_trade_id = None
-        self.data.trade_ids.clear()
-        self.data.last_trade_event_time = None
         self.data.last_update = 0.0
         self.data.last_event_time = None
+        self.data.orderbook_event_time = None
         self.data.last_sequence = None
+        self.data.book_ready = False
+        self.data.book_invalid = False
         self.data.data_quality = "DATA_INCOMPLETE"
         self.data.quality_reason = "Waiting for a valid order-book snapshot"
-        self.data.candles.clear()
-        self.data.open_interest = None
-        self.data.previous_open_interest = None
-        self.data.oi_change_pct = None
-        self.data.funding_rate = None
-        self.data.volume = None
-        self.data.volatility = None
-        self.oi_history = OIHistory()
 
     def _invalid(self, reason: str) -> None:
         self.data.data_quality = "DATA_INVALID"
         self.data.quality_reason = reason
+        self.data.book_invalid = True
+        self.data.book_ready = False
 
     def _subscription_message(self):
 
@@ -184,7 +225,7 @@ class BybitPublicFeed:
             "args": [
                 f"orderbook.{self.orderbook_depth}.{self.symbol}",
                 f"publicTrade.{self.symbol}",
-                f"kline.1.{self.symbol}",
+                *[f"kline.{interval}.{self.symbol}" for interval in (1, 3, 5, 15, 30, 60, 120, 240, "D")],
                 f"tickers.{self.symbol}",
             ],
         }
@@ -210,6 +251,18 @@ class BybitPublicFeed:
                 return
             if self.data.last_sequence is not None and sequence <= self.data.last_sequence:
                 self._invalid("Out-of-order order-book update")
+                return
+        if message.get("type") != "snapshot" and not self.data.book_ready:
+            self._invalid("Order-book delta received before a snapshot")
+            return
+        previous_sequence = data.get("pu")
+        if previous_sequence is not None and self.data.last_sequence is not None:
+            try:
+                if int(previous_sequence) != self.data.last_sequence:
+                    self._invalid("Order-book sequence gap")
+                    return
+            except (TypeError, ValueError):
+                self._invalid("Invalid order-book previous sequence")
                 return
 
         def levels(key: str) -> list[tuple[float, float]] | None:
@@ -238,6 +291,10 @@ class BybitPublicFeed:
         # -----------------------------------------
 
         if message.get("type") == "snapshot":
+
+            if not bids or not asks:
+                self._invalid("Order-book snapshot must contain both sides")
+                return
 
             self.data.bids.clear()
             self.data.asks.clear()
@@ -295,6 +352,8 @@ class BybitPublicFeed:
 
         if sequence is not None:
             self.data.last_sequence = sequence
+        self.data.book_ready = True
+        self.data.book_invalid = False
 
         best_bid = self.data.sorted_bids(1)
 
@@ -303,6 +362,7 @@ class BybitPublicFeed:
 
         self.data.last_update = time.time() if received_time is None else received_time
         self.data.last_event_time = float(message.get("ts", self.data.last_update * 1000)) / 1000
+        self.data.orderbook_event_time = self.data.last_event_time
         self.data.data_quality = "OK"
         self.data.quality_reason = ""
 
@@ -325,17 +385,11 @@ class BybitPublicFeed:
         if trade_id in self.data.trade_ids:
             return
 
-        timestamp_ms = int(
-            trade.get(
-                "T",
-                time.time() * 1000,
-            )
-        )
+        timestamp_ms = int(trade["T"])
         event_time = timestamp_ms / 1000
         if self.data.last_trade_event_time is not None and event_time < self.data.last_trade_event_time:
             self._invalid("Out-of-order trade event")
             return
-
         record = {
             "id": trade_id,
             "timestamp": timestamp_ms,
@@ -346,22 +400,27 @@ class BybitPublicFeed:
             ).upper(),
         }
 
-        if record["price"] <= 0 or record["quantity"] <= 0:
+        if record["price"] <= 0 or record["quantity"] <= 0 or record["side"] not in {"BUY", "SELL"}:
             self._invalid("Invalid trade price or quantity")
             return
 
         self.data.price = record["price"]
+        price_state = self.price_history.ingest(event_time, record["price"])
+        self.data.price_change_pct = price_state.change_pct
+        self.data.price_event_time = price_state.event_time
         self.data.last_trade_id = trade_id
         self.data.trade_ids.add(trade_id)
-        self.data.last_trade_event_time = event_time
+        self.data.last_trade_event_time = max(self.data.last_trade_event_time or event_time, event_time)
 
         self.data.trades.append(record)
+        self.data.trades.sort(key=lambda item: (item["timestamp"], item["id"]))
 
         # Keep bounded memory.
         self.data.trades = self.data.trades[-5000:]
 
         self.data.last_update = time.time() if received_time is None else received_time
-        self.data.last_event_time = event_time
+        self.data.last_event_time = max(self.data.last_event_time or event_time, event_time)
+        self.data.trade_event_time = event_time
 
     def _process_message(
         self,
@@ -407,19 +466,40 @@ class BybitPublicFeed:
                 return
             for item in data:
                 try:
+                    interval = normalize_bybit_interval(topic.split(".")[1])
                     candle = {
+                        "timeframe": interval,
                         "event_time": float(item["start"]) / 1000,
                         "open": float(item["open"]),
                         "high": float(item["high"]),
                         "low": float(item["low"]),
                         "close": float(item["close"]),
                         "volume": float(item["volume"]),
+                        "confirmed": bool(item.get("confirm", True)),
                     }
-                    if candle["low"] > min(candle["open"], candle["close"]) or candle["high"] < max(candle["open"], candle["close"]):
+                    if (candle["open"] <= 0 or candle["high"] <= 0 or candle["low"] <= 0 or candle["close"] <= 0
+                            or candle["high"] < candle["low"]
+                            or candle["low"] > min(candle["open"], candle["close"])
+                            or candle["high"] < max(candle["open"], candle["close"])
+                            or candle["volume"] < 0):
                         raise ValueError
-                    self.data.candles = [old for old in self.data.candles if old["event_time"] != candle["event_time"]][-499:]
-                    self.data.candles.append(candle)
-                    self.data.volume = candle["volume"]
+                    timeframe = self.data.candles_by_timeframe.setdefault(interval, [])
+                    timeframe[:] = [old for old in timeframe if old["event_time"] != candle["event_time"]]
+                    timeframe.append(candle)
+                    timeframe.sort(key=lambda old: old["event_time"])
+                    del timeframe[:-500]
+                    self.data.candle_event_times[interval] = candle["event_time"]
+                    if candle["confirmed"]:
+                        self.data.candle_confirmed_times[interval] = candle["event_time"]
+                    self.data.candles = [
+                        old
+                        for candles in self.data.candles_by_timeframe.values()
+                        for old in candles
+                    ]
+                    self.data.candles.sort(key=lambda old: (old["event_time"], old["timeframe"]))
+                    self.data.candles = self.data.candles[-500:]
+                    if candle["confirmed"]:
+                        self.data.volume = candle["volume"]
                     self.data.last_event_time = candle["event_time"]
                     self.data.last_update = time.time() if received_time is None else received_time
                 except (KeyError, TypeError, ValueError):
@@ -430,22 +510,33 @@ class BybitPublicFeed:
                 self._invalid("Malformed ticker payload")
                 return
             try:
-                if data.get("openInterest") is not None:
-                    event_time = float(message.get("ts", 0)) / 1000
+                event_time = float(message["ts"]) / 1000 if message.get("ts") is not None else None
+                if data.get("openInterest") is not None and event_time is not None:
                     state = self.oi_history.ingest(
                         event_time,
                         float(data["openInterest"]),
                     )
                     self.data.open_interest = state.open_interest
                     self.data.oi_change_pct = state.change_pct
+                    self.data.oi_event_time = state.event_time
+                    self.data.oi_stale = state.stale
                 if data.get("fundingRate") is not None:
                     self.data.funding_rate = float(data["fundingRate"])
+                    self.data.funding_event_time = event_time
+                    self.data.funding_stale = False
                 if data.get("volume24h") is not None:
-                    self.data.volume = float(data["volume24h"])
+                    self.data.volume_24h = float(data["volume24h"])
+                    self.data.volume_24h_event_time = event_time
+                if data.get("lastPrice") is not None:
+                    self.data.price = float(data["lastPrice"])
+                    if event_time is not None:
+                        price_state = self.price_history.ingest(event_time, self.data.price)
+                        self.data.price_change_pct = price_state.change_pct
+                        self.data.price_event_time = price_state.event_time
                 self.data.last_update = time.time() if received_time is None else received_time
-                if message.get("ts") is not None:
-                    self.data.last_event_time = float(message["ts"]) / 1000
-                values = (self.data.open_interest, self.data.funding_rate, self.data.volume)
+                if event_time is not None:
+                    self.data.last_event_time = event_time
+                values = (self.data.open_interest, self.data.funding_rate, self.data.volume, self.data.volume_24h, self.data.price)
                 if any(value is not None and not isfinite(value) for value in values):
                     raise ValueError
             except (KeyError, TypeError, ValueError):

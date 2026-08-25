@@ -11,6 +11,7 @@ class LiveMarketSnapshot:
     def __init__(
         self,
         symbol: str = "BTCUSDT",
+        stale_thresholds: dict[str, float] | None = None,
     ):
 
         self.symbol = symbol.upper()
@@ -18,6 +19,7 @@ class LiveMarketSnapshot:
         self.feed = BybitPublicFeed(
             symbol=self.symbol,
             orderbook_depth=50,
+            stale_thresholds=stale_thresholds,
         )
 
         self.orderflow = OrderFlowEngine()
@@ -87,14 +89,14 @@ class LiveMarketSnapshot:
             orderbook_imbalance=imbalance,
         )
 
-        rolling = self.rolling.snapshot()
-        quality, quality_reason = data.quality(now=calculation_time)
+        rolling = self.rolling.snapshot(as_of=data.last_event_time)
+        quality, quality_reason = data.quality(now=calculation_time, thresholds=self.feed.stale_thresholds)
 
         return MarketState(
 
             symbol=self.symbol,
 
-            timestamp=data.last_update,
+            timestamp=data.last_event_time or data.last_update,
 
             price=data.price,
 

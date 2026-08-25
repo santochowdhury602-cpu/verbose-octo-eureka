@@ -11,6 +11,7 @@ class Signal:
     score: float
     active: bool = True
     reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         direction = self.direction.upper()
@@ -36,6 +37,7 @@ class Signal:
             "score": self.score,
             "active": self.active,
             "reason": self.reason,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -109,6 +111,12 @@ class ConfluenceEngine:
         "displacement": 20.0,
         "fvg": 15.0,
         "orderflow": 20.0,
+        "mtf": 10.0,
+        "microstructure": 10.0,
+        "vwap": 5.0,
+        "funding": 5.0,
+        "rvol": 5.0,
+        "volume_profile": 3.0,
     }
 
     def __init__(
@@ -237,6 +245,64 @@ class ConfluenceEngine:
             reason,
         )
 
+    def mtf(self, direction: str, alignment_score: float, reason: str = "") -> Signal:
+        return Signal(
+            name="MTF Alignment",
+            direction=direction.upper(),
+            score=min(self.weights["mtf"], max(0.0, float(alignment_score) / 10.0)),
+            reason=reason,
+            metadata={"alignment_score": float(alignment_score), "dedupe_group": "mtf"},
+        )
+
+    def microstructure(self, direction: str, score: float, *, components: dict[str, Any] | None = None) -> Signal:
+        return Signal(
+            name="Microstructure",
+            direction=direction.upper(),
+            score=min(self.weights["microstructure"], max(0.0, float(score))),
+            metadata={
+                "components": dict(components or {}),
+                "dedupe_group": "microstructure",
+                "dedupe_rule": "capped residual after orderflow and liquidity evidence",
+            },
+        )
+
+    def vwap(self, direction: str, reason: str = "") -> Signal:
+        return self._make_signal("VWAP Context", direction, "vwap", reason=reason)
+
+    def funding(self, direction: str, reason: str = "") -> Signal:
+        return self._make_signal("Funding", direction, "funding", reason=reason)
+
+    def rvol(self, direction: str, reason: str = "") -> Signal:
+        return self._make_signal("RVOL Confirmation", direction, "rvol", reason=reason)
+
+    def volume_profile(self, direction: str, reason: str = "") -> Signal:
+        return self._make_signal("Volume Profile Context", direction, "volume_profile", reason=reason)
+
+    def oi(
+        self,
+        direction: str,
+        *,
+        confidence: float,
+        price_change_pct: float,
+        oi_change_pct: float,
+        interpretation: str,
+        event_time: float | None,
+    ) -> Signal:
+        """Create a bounded OI signal from an actual price/OI interpretation."""
+        return Signal(
+            name="Open Interest",
+            direction=direction.upper(),
+            score=min(self.weights.get("oi", 10.0), max(0.0, float(confidence) / 10.0)),
+            reason=interpretation,
+            metadata={
+                "confidence": float(confidence),
+                "price_change_pct": float(price_change_pct),
+                "oi_change_pct": float(oi_change_pct),
+                "interpretation": interpretation,
+                "event_time": event_time,
+            },
+        )
+
     # =========================================================
     # ANALYSIS
     # =========================================================
@@ -251,20 +317,24 @@ class ConfluenceEngine:
             if x.active
         ]
 
+        # New contextual signals are deliberately bounded and use distinct
+        # evidence groups; microstructure receives only residual credit in the pipeline.
+        active_scores = {id(signal): min(100.0, max(0.0, signal.score)) for signal in active}
+
         bullish_score = sum(
-            x.score
+            active_scores[id(x)]
             for x in active
             if x.direction == "BULLISH"
         )
 
         bearish_score = sum(
-            x.score
+            active_scores[id(x)]
             for x in active
             if x.direction == "BEARISH"
         )
 
         total_possible = sum(
-            x.score
+            active_scores[id(x)]
             for x in active
             if x.direction != "NEUTRAL"
         )

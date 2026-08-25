@@ -16,11 +16,12 @@ class LiveSnapshotContextAdapter:
             return None
 
         data = self.snapshot.feed.data
-        quality, quality_reason = data.quality(now=calculation_time)
-        if quality == "OK" and data.open_interest is None:
+        quality, quality_reason = data.quality(now=calculation_time, thresholds=self.snapshot.feed.stale_thresholds)
+        price_state = self.snapshot.feed.price_history.state(as_of=data.last_event_time)
+        if quality in {"OK", "DATA_VALID"} and data.open_interest is None:
             quality = "DATA_INCOMPLETE"
             quality_reason = "Open interest is unavailable"
-        if quality == "OK" and data.funding_rate is None:
+        if quality in {"OK", "DATA_VALID"} and data.funding_rate is None:
             quality = "DATA_INCOMPLETE"
             quality_reason = "Funding is unavailable"
         order_book = None
@@ -44,13 +45,26 @@ class LiveSnapshotContextAdapter:
             for item in data.trades
             if item.get("id") is not None
         )
+        candles = tuple(
+            Candle(
+                event_time=float(item["event_time"]),
+                open=float(item["open"]),
+                high=float(item["high"]),
+                low=float(item["low"]),
+                close=float(item["close"]),
+                volume=float(item["volume"]),
+            )
+            for item in data.candles
+            if item.get("confirmed", True)
+        )
         flow = state.order_flow
         return (
             MarketContextBuilder(state.symbol, state.price, state.timeframe)
             .set_exchange("BYBIT")
             .set_price(state.price, volume=data.volume)
+            .set_price_change_pct(price_state.change_pct)
             .set_market_data(
-                candles=tuple(Candle(**candle) for candle in data.candles),
+                candles=candles,
                 order_book=order_book,
                 trades=trades,
                 delta=flow.get("delta"),
@@ -64,6 +78,25 @@ class LiveSnapshotContextAdapter:
                 received_time=data.last_update,
                 calculation_time=calculation_time,
             )
+            .add_metadata("candles_by_timeframe", {
+                timeframe: tuple(
+                    {
+                        "event_time": float(item["event_time"]),
+                        "open": float(item["open"]),
+                        "high": float(item["high"]),
+                        "low": float(item["low"]),
+                        "close": float(item["close"]),
+                        "volume": float(item["volume"]),
+                    }
+                    for item in items
+                    if item.get("confirmed", True)
+                )
+                for timeframe, items in data.candles_by_timeframe.items()
+            })
+            .add_metadata("volume_24h", data.volume_24h)
+            .add_metadata("volume_24h_event_time", data.volume_24h_event_time)
+            .add_metadata("funding_event_time", data.funding_event_time)
+            .add_metadata("oi_event_time", data.oi_event_time)
             .set_data_quality(quality, quality_reason)
             .build(allow_incomplete=True)
         )
